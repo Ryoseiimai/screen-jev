@@ -1,0 +1,6 @@
+testproj/
+*.pyc
+__pycache__/
+bin/sjev-helper
+evidence/
+RESEARCH.md

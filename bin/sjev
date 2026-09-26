@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+"""
+sjev: 画面Jev(screen-jev) メインCLI。標準ライブラリのみ使用(外部pip禁止)。
+
+サブコマンド:
+  ensure   - 見張りループが動いていなければ起動する(SessionStartフックから呼ぶ)
+  watch    - 見張りループを前面で実行する(ensureが裏で使う)
+  pause N  - N分/N時間だけ記録を止める(例: 30m, 1h)
+  resume   - pauseを解除する
+  status   - 動作状況を表示する
+  now      - いまの画面状況(フックと同じ中身)を人間向けに表示する
+  log N    - 直近N分/N時間の記録を表示する
+  hook     - UserPromptSubmitフック本体。stdinのJSONを読みadditionalContextを出す
+
+データは常に ~/.screen-jev/ に置く(installの--projectはフックの登録先を変えるだけ)。
+"""
+import json
+import os
+import re
+import sys
+import time
+import signal
+import subprocess
+import glob
+import tempfile
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+DATA_DIR = os.path.join(HOME, ".screen-jev")
+BIN_DIR = os.path.join(DATA_DIR, "bin")
+_INSTALLED_HELPER = os.path.join(BIN_DIR, "sjev-helper")
+_DEV_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sjev-helper")
+HELPER = _INSTALLED_HELPER if os.path.exists(_INSTALLED_HELPER) else _DEV_HELPER
+TIMELINE_PATH = os.path.join(DATA_DIR, "timeline.jsonl")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+PIDFILE = os.path.join(DATA_DIR, "watch.pid")
+PAUSEFILE = os.path.join(DATA_DIR, "pause_until")
+LOGFILE = os.path.join(DATA_DIR, "watch.log")
+API_KEY_PATH = os.environ.get(
+    "SJEV_JEV_KEY_FILE", os.path.expanduser("~/.config/typesafe/api_key")
+)
+API_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+API_MODEL = "jev-latest"
+
+RETENTION_SECONDS = 24 * 3600
+FRONT_INTERVAL = 5          # 最前面チェック間隔(秒)
+FRONT_STALE_SECONDS = 30    # 同じ画面でも撮り直す間隔
+FULL_INTERVAL = 300         # 全ディスプレイ撮影間隔(秒)
+JEV_MIN_INTERVAL = 60       # Jev判定の最短間隔(秒)
+MAX_TEXT_CHARS = 4000
+HOOK_MAX_CHARS = 2500
+
+TERMINAL_BUNDLES = {
+    "com.apple.Terminal",
+    "com.googlecode.iterm2",
+    "com.mitchellh.ghostty",
+    "io.ghostty.Ghostty",
+    "net.kovidgoyal.kitty",
+    "com.github.wez.wezterm",
+    "dev.warp.Warp-Stable",
+    "co.zeit.hyper",
+}
+
+DEFAULT_CONFIG = {
+    "exclude_apps": [
+        "1Password", "1Password 7", "1Password 8",
+        "Keychain Access", "キーチェーンアクセス",
+        "Bitwarden", "LastPass",
+    ],
+    "exclude_title_words": [
+        "password", "パスワード", "暗証", "bank", "銀行", "secret",
+        "秘密鍵", "credit card", "カード番号",
+    ],
+    "hook_enabled": True,
+    # Jevへの外部送信は既定オフ。オンにするには config.json の "jev" を true にする。
+    "jev": False,
+}
+
+# --- 伏せ字(マスク) ---
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+TOKEN_RE = re.compile(
+    r"\b("
+    r"sk-ant-[A-Za-z0-9_-]{20,}"       # Anthropic
+    r"|sk_live_[A-Za-z0-9]{10,}"        # Stripe secret
+    r"|rk_live_[A-Za-z0-9]{10,}"        # Stripe restricted
+    r"|AIza[A-Za-z0-9_-]{20,}"          # Google
+    r"|sk-[A-Za-z0-9]{10,}"             # OpenAI等
+    r"|gh[ops]_[A-Za-z0-9]{20,}"        # GitHub (gho_/ghp_/ghs_)
+    r"|ghu_[A-Za-z0-9]{20,}"            # GitHub user-to-server
+    r"|github_pat_[A-Za-z0-9_]{20,}"    # GitHub fine-grained PAT
+    r"|AKIA[0-9A-Z]{12,}"               # AWS
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"    # Slack
+    r")\b"
+)
+JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b")
+GENERIC_LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_\-]{32,}\b")
+CARD_NUMBER_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+# 日本の電話番号(固定/携帯、ハイフンあり・なし)
+PHONE_RE = re.compile(
+    r"\b0\d{1,4}[- ]?\d{1,4}[- ]?\d{3,4}\b"
+)
+# 「パスワード:」「password:」「PIN:」等のラベルの後ろの値(改行・スペース区切りまで)
+LABELED_SECRET_RE = re.compile(
+    r"(?i)(パスワード|password|pin|暗証番号)\s*[:：]\s*(\S+)"
+)
+
+
+def mask_sensitive(text: str) -> str:
+    """API送信・記録前に、鍵らしき文字列・カード番号らしき数字列・メールを伏せ字にする。
+
+    意図的な簡略化: 除外はアプリ名・ウィンドウ名の一致だけで、画面内の文字自体を
+    解析して機密度を判定してはいない。短い記号混じりのパスワードや、上記正規表現の
+    どれにも当てはまらない独自形式の鍵は伏せきれない場合がある。パスワード欄は通常
+    ●●●で表示されるため文字としては読み取られない(OCR対象外)。
+    """
+    if not text:
+        return text
+    masked = LABELED_SECRET_RE.sub(lambda m: f"{m.group(1)}: [伏せ字]", text)
+    masked = EMAIL_RE.sub("[伏せ字]", masked)
+    masked = TOKEN_RE.sub("[伏せ字]", masked)
+    masked = JWT_RE.sub("[伏せ字]", masked)
+    masked = CARD_NUMBER_RE.sub("[伏せ字]", masked)
+    masked = PHONE_RE.sub("[伏せ字]", masked)
+    masked = GENERIC_LONG_TOKEN_RE.sub("[伏せ字]", masked)
+    return masked
+
+
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True, mode=0o700)
+
+
+def load_config():
+    ensure_data_dir()
+    if not os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+        os.chmod(CONFIG_PATH, 0o600)
+        return dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        cfg = {}
+    merged = dict(DEFAULT_CONFIG)
+    merged.update(cfg)
+    return merged
+
+
+def is_excluded(app_name, title, cfg):
+    for a in cfg.get("exclude_apps", []):
+        if a and a.lower() in (app_name or "").lower():
+            return True
+    low_title = (title or "").lower()
+    for w in cfg.get("exclude_title_words", []):
+        if w and w.lower() in low_title:
+            return True
+    return False
+
+
+def append_timeline(entry: dict):
+    ensure_data_dir()
+    with open(TIMELINE_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    os.chmod(TIMELINE_PATH, 0o600)
+
+
+def prune_timeline():
+    """24時間より古い行を消す。"""
+    if not os.path.exists(TIMELINE_PATH):
+        return
+    cutoff = time.time() - RETENTION_SECONDS
+    kept = []
+    with open(TIMELINE_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("ts", 0) >= cutoff:
+                kept.append(line)
+    with open(TIMELINE_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(kept) + ("\n" if kept else ""))
+    os.chmod(TIMELINE_PATH, 0o600)
+
+
+def read_timeline(since_ts=None):
+    if not os.path.exists(TIMELINE_PATH):
+        return []
+    out = []
+    with open(TIMELINE_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if since_ts is None or obj.get("ts", 0) >= since_ts:
+                out.append(obj)
+    return out
+
+
+def parse_duration(s: str) -> int:
+    """'30m' '1h' '90s' -> 秒数"""
+    m = re.match(r"^(\d+)([smh])$", s.strip())
+    if not m:
+        raise ValueError(f"unknown duration: {s}")
+    n, unit = int(m.group(1)), m.group(2)
+    return n * {"s": 1, "m": 60, "h": 3600}[unit]
+
+
+# --- helper呼び出し ---
+def helper_front():
+    try:
+        out = subprocess.run([HELPER, "front"], capture_output=True, timeout=5, text=True)
+        return json.loads(out.stdout or "{}")
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def helper_displays():
+    """アクティブなディスプレイ数を返す(取得できなければ1とみなす)。"""
+    try:
+        out = subprocess.run([HELPER, "displays"], capture_output=True, timeout=5, text=True)
+        data = json.loads(out.stdout or "{}")
+        count = int(data.get("count", 1))
+        return max(1, count)
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError, ValueError, TypeError):
+        return 1
+
+
+def helper_ocr(png_path):
+    try:
+        out = subprocess.run([HELPER, "ocr", png_path], capture_output=True, timeout=15, text=True)
+        data = json.loads(out.stdout or "{}")
+        return data.get("lines", [])
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return []
+
+
+def capture_front_window(window_id):
+    """最前面ウィンドウだけをキャプチャし、テキスト行を返して画像は即削除する。"""
+    fd, path = tempfile.mkstemp(prefix="sjev-", suffix=".png", dir=tempfile.gettempdir())
+    os.close(fd)
+    os.chmod(path, 0o600)
+    try:
+        subprocess.run(
+            ["/usr/sbin/screencapture", "-x", "-o", "-l", str(window_id), path],
+            capture_output=True, timeout=10,
+        )
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return []
+        return helper_ocr(path)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def capture_full_screens():
+    """全ディスプレイをキャプチャし、テキスト行(結合)を返して画像は即削除する。
+
+    バグ修正: `screencapture -x <prefix>` はプレフィックスを1枚のファイル名として扱い
+    (拡張子なし・メイン画面のみ)、`prefix*.png` のglobに一致しないため削除されず
+    $TMPDIR に残り続けていた。画面数ぶんの明示ファイル名を渡して確実に回収・削除する。
+    """
+    prefix = os.path.join(tempfile.gettempdir(), f"sjev-full-{os.getpid()}-{int(time.time() * 1000)}-")
+    count = helper_displays()
+    paths = [f"{prefix}{i + 1}.png" for i in range(count)]
+    try:
+        subprocess.run(
+            ["/usr/sbin/screencapture", "-x", *paths], capture_output=True, timeout=15,
+        )
+        lines = []
+        for p in paths:
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                os.chmod(p, 0o600)
+                lines.extend(helper_ocr(p))
+        return lines
+    finally:
+        # 明示パスに加えて、想定外の命名で作られた残骸も同一プレフィックスなら掃除する。
+        for p in set(paths) | set(glob.glob(prefix + "*")):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+# --- Jev判定 ---
+def load_api_key():
+    if not os.path.exists(API_KEY_PATH):
+        return None
+    try:
+        with open(API_KEY_PATH, encoding="utf-8") as f:
+            key = f.read().strip()
+        return key or None
+    except OSError:
+        return None
+
+
+def call_jev(state_text: str, cfg=None):
+    cfg = cfg or load_config()
+    if not cfg.get("jev", False):
+        return None
+    key = load_api_key()
+    if not key:
+        return None
+    questions = {
+        "activity": {
+            "type": "choice",
+            "instructions": "いまの画面から推測される作業内容",
+            "criteria": {
+                "コードを書いている": None,
+                "ブラウザで調べている": None,
+                "文章や資料を作っている": None,
+                "チャット・メール": None,
+                "会議・動画": None,
+                "設定や管理画面": None,
+                "その他": None,
+            },
+        },
+        "error_on_screen": {
+            "type": "noul",
+            "instructions": "画面にエラーや警告が表示されているか",
+        },
+        "stuck": {
+            "type": "noul",
+            "instructions": "同じ画面で詰まっていそうか",
+        },
+    }
+    payload = {"state": state_text, "model": API_MODEL, "questions": questions}
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            API_ENDPOINT,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        return body.get("answers")
+    except Exception:
+        return None
+
+
+# --- watch ループ ---
+def is_paused():
+    if not os.path.exists(PAUSEFILE):
+        return False
+    try:
+        with open(PAUSEFILE, encoding="utf-8") as f:
+            until = float(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    if time.time() >= until:
+        try:
+            os.remove(PAUSEFILE)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def watch_loop():
+    os.umask(0o077)
+    ensure_data_dir()
+    with open(PIDFILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+    def handle_term(signum, frame):
+        try:
+            os.remove(PIDFILE)
+        except OSError:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_term)
+    signal.signal(signal.SIGINT, handle_term)
+
+    cfg = load_config()
+    last_key = None       # (app, window_id)
+    last_capture_ts = 0
+    last_full_ts = 0
+    last_jev_ts = 0
+    last_prune_ts = 0
+    empty_screencap_streak = 0
+
+    while True:
+        try:
+            if is_paused():
+                time.sleep(FRONT_INTERVAL)
+                continue
+
+            info = helper_front()
+            app = info.get("app", "")
+            bundle = info.get("bundle", "")
+            title = info.get("title", "")
+            window_id = info.get("window_id", -1)
+            now = time.time()
+
+            key = (app, window_id, title)
+            changed = key != last_key
+            stale_due = (now - last_capture_ts) >= FRONT_STALE_SECONDS
+
+            if app and (changed or stale_due):
+                if is_excluded(app, title, cfg):
+                    append_timeline({
+                        "ts": now, "app": app, "bundle": bundle, "title": "",
+                        "kind": "excluded", "text": "",
+                    })
+                else:
+                    lines = capture_front_window(window_id) if window_id and window_id > 0 else []
+                    text = mask_sensitive("\n".join(lines))[:MAX_TEXT_CHARS]
+                    if window_id and window_id > 0 and not lines:
+                        empty_screencap_streak += 1
+                    else:
+                        empty_screencap_streak = 0
+                    entry = {
+                        "ts": now, "app": app, "bundle": bundle, "title": title,
+                        "kind": "front", "text": text,
+                    }
+                    if text and (now - last_jev_ts) >= JEV_MIN_INTERVAL:
+                        answers = call_jev(f"app={app} title={title}\n{text}", cfg)
+                        if answers:
+                            entry["jev"] = answers
+                            last_jev_ts = now
+                    append_timeline(entry)
+                last_capture_ts = now
+                last_key = key
+
+            if (now - last_full_ts) >= FULL_INTERVAL and not is_paused():
+                lines = capture_full_screens()
+                text = mask_sensitive("\n".join(lines))[:MAX_TEXT_CHARS]
+                append_timeline({
+                    "ts": now, "app": app, "bundle": bundle, "title": "(全ディスプレイ)",
+                    "kind": "full", "text": text,
+                })
+                last_full_ts = now
+
+            if (now - last_prune_ts) >= 3600:
+                prune_timeline()
+                last_prune_ts = now
+
+        except Exception as e:  # noqa: BLE001 見張りは止めない
+            with open(LOGFILE, "a", encoding="utf-8") as f:
+                f.write(f"{time.time()} error: {e}\n")
+
+        time.sleep(FRONT_INTERVAL)
+
+
+def pid_running(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def cmd_ensure():
+    ensure_data_dir()
+    if os.path.exists(PIDFILE):
+        try:
+            with open(PIDFILE, encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            if pid_running(pid):
+                print(f"既に起動中 pid={pid}")
+                return
+        except (OSError, ValueError):
+            pass
+    # SessionStartフックはこの後の対話をブロックしたくないため、
+    # ここで完全にデタッチして常駐化する(launchdは画面収録許可が効かないことがあるため簡略化)。
+    self_path = os.path.abspath(sys.argv[0])
+    with open(LOGFILE, "a", encoding="utf-8") as logf:
+        subprocess.Popen(
+            [sys.executable, self_path, "watch"],
+            stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    print("起動しました")
+
+
+def cmd_pause(arg):
+    ensure_data_dir()
+    seconds = parse_duration(arg)
+    until = time.time() + seconds
+    with open(PAUSEFILE, "w", encoding="utf-8") as f:
+        f.write(str(until))
+    print(f"{arg} 停止しました")
+
+
+def cmd_resume():
+    if os.path.exists(PAUSEFILE):
+        os.remove(PAUSEFILE)
+    print("再開しました")
+
+
+def check_permission_hint(entries):
+    """画面収録の許可が無い状態を簡易検知する。"""
+    fronts = [e for e in entries if e.get("kind") == "front"]
+    if len(fronts) >= 3 and all(not e.get("text") and not e.get("title") for e in fronts[-3:]):
+        return True
+    return False
+
+
+def cmd_status():
+    ensure_data_dir()
+    running = False
+    pid = None
+    if os.path.exists(PIDFILE):
+        try:
+            with open(PIDFILE, encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            running = pid_running(pid)
+        except (OSError, ValueError):
+            pass
+    entries = read_timeline()
+    last_ts = entries[-1]["ts"] if entries else None
+    print(f"動作中: {running}" + (f" (pid={pid})" if pid else ""))
+    print(f"一時停止中: {is_paused()}")
+    print(f"記録件数: {len(entries)}")
+    if last_ts:
+        print(f"最終記録: {datetime.fromtimestamp(last_ts).isoformat()}")
+    if check_permission_hint(entries):
+        print("画面収録の許可がありません。次を開いて許可してください:")
+        print('  open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"')
+
+
+def pick_last_non_terminal(entries):
+    for e in reversed(entries):
+        if e.get("kind") not in ("front", "full"):
+            continue
+        if e.get("bundle") in TERMINAL_BUNDLES:
+            continue
+        if e.get("text"):
+            return e
+    return None
+
+
+def build_context(max_chars=HOOK_MAX_CHARS):
+    now = datetime.now()
+    since = time.time() - 600
+    entries = read_timeline(since_ts=since)
+
+    lines = ["[画面Jev] いまの画面状況", f"現在時刻: {now.strftime('%Y-%m-%d %H:%M:%S')}"]
+
+    lines.append("直近10分のアプリ遷移:")
+    transitions = []
+    last_app = None
+    for e in entries:
+        if e.get("kind") not in ("front",):
+            continue
+        if e.get("app") != last_app:
+            t = datetime.fromtimestamp(e["ts"]).strftime("%H:%M:%S")
+            transitions.append(f"  {t} {e.get('app', '')} - {e.get('title', '')}")
+            last_app = e.get("app")
+    if transitions:
+        lines.extend(transitions[-10:])
+    else:
+        lines.append("  (記録なし)")
+
+    last_non_terminal = pick_last_non_terminal(read_timeline())
+    if last_non_terminal:
+        excerpt = last_non_terminal.get("text", "")[:800]
+        lines.append(
+            f"直前に見ていた画面 ({last_non_terminal.get('app', '')} / "
+            f"{last_non_terminal.get('title', '')}):"
+        )
+        lines.append(excerpt)
+        jev = last_non_terminal.get("jev")
+        if jev:
+            lines.append(f"Jevの判定: {json.dumps(jev, ensure_ascii=False)}")
+    else:
+        lines.append("直前に見ていた画面: (記録なし)")
+
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[: max_chars - 3] + "..."
+    return text
+
+
+def cmd_now():
+    print(build_context())
+
+
+def cmd_log(arg):
+    seconds = parse_duration(arg)
+    since = time.time() - seconds
+    for e in read_timeline(since_ts=since):
+        t = datetime.fromtimestamp(e["ts"]).strftime("%H:%M:%S")
+        print(f"{t} [{e.get('kind')}] {e.get('app')} - {e.get('title')} :: {e.get('text', '')[:80]}")
+
+
+def is_unattended():
+    entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
+    # 実測: 対話CLIは "cli"、無人実行(claude -p / SDK経由)は "sdk-cli" 等になる。
+    # "cli" 以外はすべて無人扱いにする(安全側)。
+    return entrypoint != "cli"
+
+
+def cmd_hook():
+    cfg = load_config()
+    try:
+        raw = sys.stdin.read()
+        json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        pass
+
+    if not cfg.get("hook_enabled", True):
+        print(json.dumps({}))
+        return
+    if is_unattended():
+        print(json.dumps({}))
+        return
+
+    context = build_context()
+    out = {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    }
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    cmd = sys.argv[1]
+    if cmd == "ensure":
+        cmd_ensure()
+    elif cmd == "watch":
+        watch_loop()
+    elif cmd == "pause":
+        cmd_pause(sys.argv[2] if len(sys.argv) > 2 else "30m")
+    elif cmd == "resume":
+        cmd_resume()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "now":
+        cmd_now()
+    elif cmd == "log":
+        cmd_log(sys.argv[2] if len(sys.argv) > 2 else "30m")
+    elif cmd == "hook":
+        cmd_hook()
+    else:
+        print(f"unknown command: {cmd}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
